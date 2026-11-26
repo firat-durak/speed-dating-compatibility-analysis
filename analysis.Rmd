@@ -1,0 +1,335 @@
+---
+output:
+  github_document:
+    html_preview: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.path = "figures/", fig.width = 7.5, fig.height = 4.2, dpi = 150)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(survival)
+library(sandwich)
+
+set.seed(2026)
+teal <- "#0f6b5c"
+amber <- "#c27c0e"
+theme_set(theme_minimal(base_size = 12) +
+            theme(panel.grid.minor = element_blank(), plot.title.position = "plot",
+                  legend.position = "bottom", strip.text = element_text(face = "bold")))
+
+attrs <- c(attr = "Attractive", sinc = "Sincere", intel = "Intelligent",
+           fun = "Fun", amb = "Ambitious", shar = "Shared interests")
+attr_nouns <- c(attr = "attractiveness", sinc = "sincerity", intel = "intelligence",
+                fun = "fun", amb = "ambition", shar = "shared interests")
+in_scale <- function(x) if_else(x >= 1 & x <= 10, x, NA_real_)
+num <- function(x, digits = 2) formatC(x, format = "f", digits = digits)
+pct <- function(x, digits = 0) paste0(num(100 * x, digits), "%")
+or_ci <- function(row, digits = 2) paste0(num(row$or, digits), " (95% CI ", num(row$lo, digits), " to ", num(row$hi, digits), ")")
+or_par <- function(row, digits = 2) paste0("OR ", num(row$or, digits), ", 95% CI ", num(row$lo, digits), " to ", num(row$hi, digits))
+n_fmt <- function(x) format(x, big.mark = ",")
+pval <- function(p) if_else(p < 0.001, "< 0.001", paste("=", num(p, 3)))
+```
+
+```{r data}
+raw <- read.csv("data/raw/speed_dating.csv") |> as_tibble()
+
+people <- raw |>
+  distinct(iid, .keep_all = TRUE) |>
+  select(iid, field_cd)
+
+dates <- raw |>
+  transmute(
+    rater = iid, partner = pid, wave, order,
+    gender = if_else(gender == 0, "Women", "Men"),
+    said_yes = dec,
+    across(all_of(names(attrs)), in_scale),
+    across(c(attr1_1, sinc1_1, intel1_1, fun1_1, amb1_1, shar1_1), \(x) x,
+           .names = "stated_{sub('1_1', '', .col)}")
+  )
+
+pairs <- raw |>
+  filter(gender == 0) |>
+  transmute(
+    woman = iid, man = pid, wave = factor(wave), match,
+    across(all_of(names(attrs)), in_scale, .names = "her_{.col}"),
+    across(all_of(paste0(names(attrs), "_o")), in_scale, .names = "his_{sub('_o', '', .col)}"),
+    same_race = samerace, int_corr, age_gap = abs(age - age_o), woman_field = field_cd
+  ) |>
+  left_join(people |> select(man = iid, man_field = field_cd), by = "man") |>
+  mutate(same_field = as.integer(woman_field == man_field))
+
+clustered_or <- function(fit, clusters, terms) {
+  se <- sqrt(diag(vcovCL(fit, cluster = clusters)))
+  tibble(term = names(coef(fit)), b = coef(fit), se = se) |>
+    filter(term %in% terms) |>
+    mutate(or = exp(b), lo = exp(b - 1.96 * se), hi = exp(b + 1.96 * se),
+           p = 2 * pnorm(-abs(b / se)), p_bh = p.adjust(p, "BH"))
+}
+```
+
+```{r match-model}
+rating_terms <- c(paste0("her_", names(attrs)), paste0("his_", names(attrs)))
+match_data <- pairs |> select(woman, man, wave, match, all_of(rating_terms)) |> drop_na()
+match_fit <- glm(reformulate(c(rating_terms, "wave"), "match"), family = binomial, data = match_data)
+match_or <- clustered_or(match_fit, match_data[, c("woman", "man")], rating_terms) |>
+  mutate(side = if_else(startsWith(term, "her_"), "Her rating of him", "His rating of her"),
+         attribute = attrs[sub("^(her|his)_", "", term)])
+m1 <- \(t) match_or |> filter(term == t)
+n_sig_match <- sum(match_or$p_bh < 0.05)
+```
+
+```{r similarity}
+sim_terms <- c("same_race", "int_corr_sd", "age_gap_5", "same_field")
+sim_labels <- c(same_race = "Same race", int_corr_sd = "Interest correlation (+1 SD)",
+                age_gap_5 = "Age gap (+5 years)", same_field = "Same field of study")
+sim_data <- pairs |>
+  select(woman, man, wave, match, same_race, int_corr, age_gap, same_field, all_of(rating_terms)) |>
+  drop_na() |>
+  mutate(int_corr_sd = int_corr / sd(int_corr), age_gap_5 = age_gap / 5)
+sim_fit <- glm(reformulate(c(sim_terms, "wave"), "match"), family = binomial, data = sim_data)
+sim_adj_fit <- glm(reformulate(c(sim_terms, rating_terms, "wave"), "match"),
+                   family = binomial, data = sim_data)
+sim_clusters <- sim_data[, c("woman", "man")]
+sim_or <- bind_rows(
+  clustered_or(sim_fit, sim_clusters, sim_terms) |> mutate(model = "Similarity only"),
+  clustered_or(sim_adj_fit, sim_clusters, sim_terms) |> mutate(model = "Plus both sides' ratings")
+) |>
+  mutate(label = sim_labels[term], model = factor(model, c("Similarity only", "Plus both sides' ratings")))
+s1 <- \(t, m) sim_or |> filter(term == t, model == m)
+```
+
+```{r ordering}
+first_yes <- dates |>
+  group_by(rater, gender) |>
+  summarise(event = as.integer(any(said_yes == 1)),
+            time = if_else(event == 1, min(order[said_yes == 1]), max(order)),
+            .groups = "drop")
+km <- survfit(Surv(time, event) ~ gender, data = first_yes)
+km_at <- summary(km, times = 3)
+still_no_3 <- set_names(km_at$surv, sub("gender=", "", km_at$strata))
+km_median <- set_names(summary(km)$table[, "median"], c("Men", "Women"))
+
+order_or <- dates |>
+  split(~gender) |>
+  imap(\(d, g) {
+    fit <- clogit(said_yes ~ order + strata(rater), data = d)
+    b <- coef(fit)[["order"]]
+    se <- sqrt(vcov(fit)[1, 1])
+    tibble(gender = g, b = b, or = exp(b), lo = exp(b - 1.96 * se), hi = exp(b + 1.96 * se),
+           p = 2 * pnorm(-abs(b / se)))
+  }) |>
+  bind_rows() |>
+  mutate(p_bh = p.adjust(p, "BH"))
+o1 <- \(g) order_or |> filter(gender == g)
+```
+
+```{r revealed}
+z <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+z_terms <- paste0("z_", names(attrs))
+rev_data <- dates |>
+  group_by(rater) |>
+  mutate(across(all_of(names(attrs)), z, .names = "z_{.col}")) |>
+  ungroup() |>
+  select(rater, gender, said_yes, all_of(z_terms), starts_with("stated_")) |>
+  drop_na() |>
+  filter(if_all(all_of(z_terms), is.finite))
+
+to_share <- function(b) 100 * pmax(b, 0) / sum(pmax(b, 0))
+revealed_share <- function(d, strata_var = "rater") {
+  fit <- clogit(reformulate(c(z_terms, paste0("strata(", strata_var, ")")), "said_yes"), data = d)
+  to_share(coef(fit)[z_terms])
+}
+boot_share <- function(d, reps = 500) {
+  ids <- unique(d$rater)
+  map(seq_len(reps), \(i) {
+    draw <- tibble(rater = sample(ids, replace = TRUE), boot_id = seq_along(ids))
+    revealed_share(inner_join(draw, d, by = "rater", relationship = "many-to-many"), "boot_id")
+  }) |>
+    do.call(what = rbind)
+}
+
+revealed <- rev_data |>
+  split(~gender) |>
+  imap(\(d, g) {
+    boot <- boot_share(d)
+    tibble(gender = g, attribute = names(attrs), share = revealed_share(d),
+           lo = apply(boot, 2, quantile, 0.025), hi = apply(boot, 2, quantile, 0.975))
+  }) |>
+  bind_rows()
+
+stated_people <- dates |>
+  distinct(rater, gender, across(starts_with("stated_"))) |>
+  drop_na() |>
+  pivot_longer(starts_with("stated_"), names_to = "attribute", names_prefix = "stated_",
+               values_to = "points") |>
+  group_by(rater) |>
+  mutate(share = 100 * points / sum(points)) |>
+  ungroup()
+stated <- stated_people |>
+  group_by(gender, attribute) |>
+  summarise(lo = mean(share) - 1.96 * sd(share) / sqrt(n()),
+            hi = mean(share) + 1.96 * sd(share) / sqrt(n()),
+            share = mean(share), .groups = "drop")
+
+pref <- bind_rows(stated |> mutate(type = "Stated before the event"),
+                  revealed |> mutate(type = "Revealed by yes/no decisions")) |>
+  mutate(attribute = factor(attrs[attribute], rev(attrs)),
+         type = factor(type, c("Stated before the event", "Revealed by yes/no decisions")))
+p1 <- \(g, a, t) pref |> filter(gender == g, attribute == attrs[[a]], type == t)
+st <- \(g, a) p1(g, a, "Stated before the event")
+rv <- \(g, a) p1(g, a, "Revealed by yes/no decisions")
+
+own_weight <- rev_data |>
+  left_join(stated_people |> select(rater, attribute, share) |>
+              pivot_wider(names_from = attribute, values_from = share, names_prefix = "s_"),
+            by = "rater") |>
+  group_by(gender) |>
+  mutate(across(starts_with("s_"), \(x) (x - mean(x)) / 10)) |>
+  ungroup()
+int_terms <- paste0("z_", names(attrs), ":s_", names(attrs))
+moderation <- own_weight |>
+  split(~gender) |>
+  imap(\(d, g) {
+    fit <- clogit(reformulate(c(z_terms, int_terms, "strata(rater)"), "said_yes"), data = d)
+    se <- sqrt(diag(vcov(fit)))
+    tibble(gender = g, term = names(coef(fit)), b = coef(fit), se = se)
+  }) |>
+  bind_rows() |>
+  filter(term %in% int_terms) |>
+  mutate(p = 2 * pnorm(-abs(b / se)), p_bh = p.adjust(p, "BH"))
+n_mod_sig <- sum(moderation$p_bh < 0.05)
+n_mod_pos <- sum(moderation$b > 0)
+mod_sig_label <- moderation |>
+  filter(p_bh < 0.05) |>
+  mutate(label = paste0(tolower(gender), "'s weight on ", attr_nouns[gsub("^z_|:.*", "", term)])) |>
+  pull(label) |>
+  paste(collapse = " and ")
+halo <- cor(rev_data$z_attr, rev_data$z_fun)
+```
+
+# What predicts a mutual match? Evidence from 8,378 speed dates
+
+Fırat Durak · R analysis of the public Speed Dating Experiment data (Fisman, Iyengar, Kamenica and Simonson, Columbia Business School, 2002–2004)
+
+## Summary
+
+In `r n_distinct(raw$wave)` speed-dating events, `r n_distinct(raw$iid)` people went on `r n_fmt(nrow(pairs))` four-minute dates and, after each one, said yes or no to seeing that person again. A match needed two yeses, and `r pct(mean(pairs$match))` of dates produced one. This analysis asks which signals predict a mutual match, whether similar people match more often, how decisions shift over the course of an evening, and whether people choose the way they say they will. Attractiveness, fun and a sense of shared interests drove matches on both sides. Similarity in age and field of study went with more matches, but mostly through how the two people rated each other. Women became slightly more selective as the night went on. The largest gap was between stated and revealed preferences. Participants said they valued intelligence and sincerity, but their decisions were driven by attractiveness and shared interests. Every model accounts for repeated decisions by the same person, through clustered standard errors or within-person models, and Benjamini–Hochberg (BH) correction is applied wherever several variables are tested together. The code is in [`analysis.Rmd`](analysis.Rmd), and this README is rendered from it.
+
+## Key findings
+
+### 1. A mutual match depends on attraction, fun and shared interests, rated by both people
+
+Each extra point (on a 1–10 scale) in how attractive he found her raised the odds of a mutual match by a factor of `r or_ci(m1("his_attr"))`; for how attractive she found him, the factor was `r or_ci(m1("her_attr"))`. Fun and shared interests also mattered from both sides. Once these were in the model, sincerity and intelligence ratings added nothing, and ambition ratings had a small negative association. `r n_sig_match` of 12 coefficients survive BH correction.
+
+```{r fig-match, fig.height = 4.4}
+match_or |>
+  mutate(attribute = factor(attribute, rev(attrs)),
+         sig = if_else(p_bh < 0.05, "BH-adjusted p < 0.05", "Not significant")) |>
+  ggplot(aes(or, attribute, colour = sig)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+  facet_wrap(~side) +
+  scale_x_log10(breaks = c(0.8, 0.9, 1, 1.2, 1.4, 1.6)) +
+  scale_colour_manual(values = c("BH-adjusted p < 0.05" = teal, "Not significant" = "grey60"),
+                      name = NULL) +
+  labs(x = "Odds ratio for a mutual match per 1-point higher rating (95% CI, log scale)", y = NULL,
+       title = "What both people rated drives the match",
+       subtitle = paste0("Logistic regression, ", n_fmt(nrow(match_data)),
+                         " dates, event fixed effects, SEs clustered by both people"))
+```
+
+### 2. Similarity predicts little once you know how the date went
+
+Two kinds of similarity went with more matches on their own. Each additional 5 years of age gap lowered the odds of a match (`r or_par(s1("age_gap_5", "Similarity only"))`), and couples from the same field of study matched more often (`r or_par(s1("same_field", "Similarity only"))`). Both effects shrank once the model included how the two people rated each other. The age-gap estimate moved to `r or_ci(s1("age_gap_5", "Plus both sides' ratings"))` and the same-field estimate to `r or_ci(s1("same_field", "Plus both sides' ratings"))`, and neither survives BH correction. Similarity seems to work mainly through how the conversation went, not as a separate factor. Measured overlap in hobbies (`r or_par(s1("int_corr_sd", "Similarity only"))` per SD) and being of the same race (`r or_par(s1("same_race", "Similarity only"))`) showed no clear effect in either model. The data give little support to "similarity attracts" as an independent effect, and none to "opposites attract". These are behavioural and demographic proxies. This is not a test of immune-gene (MHC) dissimilarity, which would need genetic data.
+
+```{r fig-similarity, fig.height = 3.8}
+sim_or |>
+  mutate(label = factor(label, rev(sim_labels))) |>
+  ggplot(aes(or, label, colour = model)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.5)) +
+  scale_x_log10(breaks = c(0.7, 0.85, 1, 1.25, 1.5, 2, 2.5)) +
+  scale_colour_manual(values = c("Similarity only" = amber, "Plus both sides' ratings" = teal),
+                      name = NULL) +
+  labs(x = "Odds ratio for a mutual match (95% CI, log scale)", y = NULL,
+       title = "Similarity effects shrink once both sides' ratings are included",
+       subtitle = paste0(n_fmt(nrow(sim_data)), " dates with complete data, event fixed effects, SEs clustered by both people"))
+```
+
+### 3. Women grew slightly more selective as the evening went on; men did not
+
+Treating each date of the night as a step in time gives a retention-style curve, showing the share of participants who have not yet said yes to anyone. The median participant said their first yes on date `r km_median[["Men"]]` (men) and date `r km_median[["Women"]]` (women); after three dates, `r pct(still_no_3[["Men"]])` of men and `r pct(still_no_3[["Women"]])` of women had still said no to everyone. Within the same person, each later position in the evening multiplied a woman's odds of saying yes by `r num(o1("Women")$or, 3)` (95% CI `r num(o1("Women")$lo, 3)` to `r num(o1("Women")$hi, 3)`, BH-adjusted p `r pval(o1("Women")$p_bh)`), about `r pct(1 - o1("Women")$or^10)` lower odds over ten dates. For men the estimate was `r or_ci(o1("Men"), 3)`, with no clear change. Partners rotate through the evening, so the order of dates is close to random. This is the same Kaplan–Meier method I would apply to time-to-first-reply or time-to-unmatch in app conversation data.
+
+```{r fig-ordering, fig.height = 4}
+km_df <- tibble(gender = rep(sub("gender=", "", names(km$strata)), km$strata),
+                time = km$time, surv = km$surv, lo = km$lower, hi = km$upper) |>
+  bind_rows(tibble(gender = c("Men", "Women"), time = 0, surv = 1, lo = 1, hi = 1)) |>
+  arrange(gender, time)
+ggplot(km_df, aes(time, surv, colour = gender)) +
+  geom_step(aes(y = lo), linetype = 3, alpha = 0.7) +
+  geom_step(aes(y = hi), linetype = 3, alpha = 0.7) +
+  geom_step(linewidth = 1) +
+  scale_colour_manual(values = c(Men = amber, Women = teal), name = NULL) +
+  scale_y_continuous(labels = scales::percent) +
+  coord_cartesian(xlim = c(0, 12)) +
+  scale_x_continuous(breaks = 0:12) +
+  labs(x = "Date number within the evening", y = "Not yet said yes to anyone",
+       title = "Time to first yes (Kaplan–Meier, dotted lines = 95% CI)",
+       subtitle = paste0(nrow(first_yes), " participants; people with no yes are censored at their last date"))
+```
+
+### 4. People say they value intelligence and sincerity, but they choose on attractiveness and shared interests
+
+Before the event, participants divided 100 points among six attributes. Their yes/no decisions tell a different story. Men gave attractiveness `r num(st("Men", "attr")$share, 0)`% of their stated weight, but it accounted for `r num(rv("Men", "attr")$share, 0)`% (95% CI `r num(rv("Men", "attr")$lo, 0)` to `r num(rv("Men", "attr")$hi, 0)`) of what predicted their decisions; for women, the figures were `r num(st("Women", "attr")$share, 0)`% stated and `r num(rv("Women", "attr")$share, 0)`% (`r num(rv("Women", "attr")$lo, 0)` to `r num(rv("Women", "attr")$hi, 0)`) revealed. Women gave intelligence `r num(st("Women", "intel")$share, 0)`% of their stated weight but only `r num(rv("Women", "intel")$share, 0)`% (`r num(rv("Women", "intel")$lo, 0)` to `r num(rv("Women", "intel")$hi, 0)`) in practice. Shared interests went the other way. They got little weight in advance (`r num(st("Women", "shar")$share, 0)`% for women, `r num(st("Men", "shar")$share, 0)`% for men) but strongly predicted decisions (`r num(rv("Women", "shar")$share, 0)`% and `r num(rv("Men", "shar")$share, 0)`%). Stated weights were also a weak guide to each person's own choices. In `r n_mod_pos` of 12 person-level tests, the estimate pointed the expected way (more stated weight, slightly more response to that attribute), but only `r n_mod_sig` survives BH correction (`r mod_sig_label`).
+
+```{r fig-stated-revealed, fig.height = 4.6}
+pref_wide <- pref |>
+  select(gender, attribute, type, share) |>
+  pivot_wider(names_from = type, values_from = share)
+ggplot(pref, aes(share, attribute)) +
+  geom_segment(data = pref_wide,
+               aes(x = `Stated before the event`, xend = `Revealed by yes/no decisions`,
+                   y = attribute, yend = attribute),
+               colour = "grey75", linewidth = 1.2, inherit.aes = FALSE) +
+  geom_errorbar(aes(xmin = lo, xmax = hi, colour = type), width = 0.25, orientation = "y") +
+  geom_point(aes(colour = type), size = 2.8) +
+  facet_wrap(~gender) +
+  scale_colour_manual(values = c("Stated before the event" = amber,
+                                 "Revealed by yes/no decisions" = teal), name = NULL) +
+  labs(x = "Share of total importance (%), 95% CI", y = NULL,
+       title = "What people say they want vs. what predicts their yes",
+       subtitle = paste0(n_fmt(nrow(rev_data)), " decisions by ", n_distinct(rev_data$rater),
+                         " people; revealed shares from within-person models, bootstrap CIs"))
+```
+
+## How this applies to a dating product
+
+- **Rank on behaviour, not on stated preference settings.** Stated weights were a poor guide to what drove yes decisions overall, and only a weak guide to each person's own choices. An A/B test could compare a ranking model trained on likes and replies with one that follows users' stated filters, measured on mutual matches and conversations that pass a set length.
+- **Help people find common ground early.** Feeling that you share interests predicted a match from both sides, while questionnaire overlap in hobbies did not. An A/B test could compare conversation prompts that surface shared values or plans with profile badges based on matching hobby lists, measured on reply rate and conversation length.
+- **Treat queue position as a product variable.** Women's yes rate fell slightly with each later date in an evening. An A/B test could vary where the strongest candidates appear in a daily batch, or cap batch size, and compare like rate and time-to-first-like curves (the Kaplan–Meier view in finding 3) between arms.
+
+## Method notes and limitations
+
+- **Data.** Each row is one person's view of one date. Mutual-match and similarity models use one row per couple (`r n_fmt(nrow(pairs))` dates); the ordering and preference models use one row per person per date. Ratings outside the 1–10 scale were set to missing. Analyses use complete cases, and shared-interest ratings are the most often missing (`r pct(mean(is.na(dates$shar)))` of rows).
+- **Models.** Couple-level models are logistic regressions with event fixed effects and standard errors clustered on both people (`sandwich::vcovCL`). Ordering and revealed-preference models are conditional logistic regressions stratified by person (`survival::clogit`), so they compare each person's decisions only with their own other decisions. Revealed weights use each person's ratings standardised within that person; a revealed share is an attribute's positive coefficient divided by the sum of positive coefficients, with 95% CIs from `r 500` bootstrap resamples of people. Stated weights were rescaled to sum to 100 for every person, since some events used a different scale. The person-level test adds an interaction between each standardised rating and that person's stated weight for the attribute (per 10 points).
+- **Ratings and decisions were recorded together.** People filled in ratings and their yes/no on the same scorecard, so a rating may partly justify a decision already made. The ratings also overlap (within a person, attractiveness and fun ratings correlate at r = `r num(halo)`), which makes individual coefficients less stable than the overall pattern. The negative ambition coefficients in finding 1 should be read in that light.
+- **Who and what.** Participants were graduate students in New York in 2002–2004, in heterosexual pairings, on four-minute in-person dates. A match here means both said yes at the event, not a lasting relationship. Results may not carry over to a marriage-focused app or to a Muslim user base; the methods do.
+- **What the data cannot show.** There is no religion variable (only how important a same-religion partner is to each person), so religious similarity could not be tested. Nothing here is genetic, and none of it bears on MHC-based attraction.
+
+## How to reproduce
+
+Requires R (tested on `r R.version$major`.`r R.version$minor`) and pandoc.
+
+```bash
+Rscript install.R    # dplyr, tidyr, purrr, ggplot2, survival, sandwich, knitr, rmarkdown
+Rscript get_data.R   # downloads the CSV to data/raw/ and checks its SHA-256
+Rscript -e 'rmarkdown::render("analysis.Rmd", output_file = "README.md")'
+```
+
+The raw data is not included because its license is not stated; `get_data.R` downloads it from the copy hosted by Columbia University's statistics department. Source: R. Fisman, S. Iyengar, E. Kamenica and I. Simonson (2006), "Gender Differences in Mate Selection: Evidence from a Speed Dating Experiment", *Quarterly Journal of Economics* 121(2), 673–697.
+
+Package versions used: `r paste(map_chr(c("dplyr", "tidyr", "purrr", "ggplot2", "survival", "sandwich", "knitr", "rmarkdown"), \(p) paste(p, packageVersion(p))), collapse = ", ")`.
